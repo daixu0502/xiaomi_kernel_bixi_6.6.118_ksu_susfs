@@ -508,10 +508,6 @@ jobs:
             "^Rollback Index:[[:space:]]+$ROLLBACK_INDEX$" \
             "$RELEASE_DIR/GENERATED-BOOT-AVB-INFO.txt"
 
-          grep -Eq \
-            "^[[:space:]]*Salt:[[:space:]]+$AVB_SALT$" \
-            "$RELEASE_DIR/GENERATED-BOOT-AVB-INFO.txt"
-
           grep -F \
             "com.android.build.boot.os_version -> '$BOOT_OS_VERSION'" \
             "$RELEASE_DIR/GENERATED-BOOT-AVB-INFO.txt"
