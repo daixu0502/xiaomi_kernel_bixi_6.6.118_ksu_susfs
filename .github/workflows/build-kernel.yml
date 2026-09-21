@@ -1,0 +1,665 @@
+name: Build bixi GKI KernelSU SUSFS
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release 标签，例如 v6.6.118-jaco-1"
+        required: true
+        type: string
+
+      manifest_branch:
+        description: "Android Kernel Manifest 分支"
+        required: true
+        default: "common-android15-6.6-2026-01"
+        type: string
+
+      kernel_tag:
+        description: "Android Common Kernel 标签"
+        required: true
+        default: "android15-6.6-2026-01_r37"
+        type: string
+
+      build_number:
+        description: "原厂内核 BUILD_NUMBER"
+        required: true
+        default: "15863337"
+        type: string
+
+      kernelsu_ref:
+        description: "KernelSU 提交或标签"
+        required: true
+        default: "932014ab5b2c9b74a3d11e2ec4d17dd10fc9442e"
+        type: string
+
+      susfs_ref:
+        description: "susfs4ksu 提交"
+        required: true
+        default: "eba2a88a5ba303e3d79d08e0717b956e9cf784a1"
+        type: string
+
+      stock_boot_repo:
+        description: "包含原厂 boot.img 的公开 Git 仓库 HTTPS 地址"
+        required: true
+        default: "https://github.com/daixu0502/xiaomi_kernel_bixi_6.6.118_ksu_susfs.git"
+        type: string
+
+      stock_boot_ref:
+        description: "原厂 boot 仓库的分支或标签"
+        required: true
+        default: "main"
+        type: string
+
+      stock_boot_path:
+        description: "boot.img 在仓库内的相对路径"
+        required: true
+        default: "boot.img"
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bixi-kernel-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    env:
+      SRC_DIR: ${{ github.workspace }}/kernel-src
+      DIST_DIR: ${{ github.workspace }}/kernel-src/out/ksu-jaco
+      RELEASE_DIR: ${{ github.workspace }}/kernel-src/out/boot-build
+
+      STOCK_BOOT_DIR: ${{ github.workspace }}/stock-boot-source
+      STOCK_BOOT_REPO: ${{ inputs.stock_boot_repo }}
+      STOCK_BOOT_REF: ${{ inputs.stock_boot_ref }}
+      STOCK_BOOT_PATH: ${{ inputs.stock_boot_path }}
+
+      MANIFEST_BRANCH: ${{ inputs.manifest_branch }}
+      KERNEL_TAG: ${{ inputs.kernel_tag }}
+      BUILD_NUMBER: ${{ inputs.build_number }}
+
+      BOOT_IMAGE: "boot-bixi-${{ inputs.kernel_tag }}-Jaco-KSU-SUSFS.img"
+
+    steps:
+      - name: Free runner disk space
+        shell: bash
+        run: |
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL
+
+          df -h
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            repo \
+            git \
+            git-lfs \
+            curl \
+            wget \
+            python3 \
+            python-is-python3 \
+            bc \
+            bison \
+            flex \
+            build-essential \
+            ccache \
+            libssl-dev \
+            libelf-dev \
+            libncurses-dev \
+            lz4 \
+            zstd \
+            zip \
+            unzip \
+            rsync \
+            cpio \
+            dwarves \
+            ripgrep
+
+          git lfs install --skip-repo
+
+      - name: Clone stock boot repository
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git clone \
+            --depth=1 \
+            --branch "$STOCK_BOOT_REF" \
+            "$STOCK_BOOT_REPO" \
+            "$STOCK_BOOT_DIR"
+
+          git -C "$STOCK_BOOT_DIR" lfs pull
+
+          STOCK_BOOT="$STOCK_BOOT_DIR/$STOCK_BOOT_PATH"
+
+          if [[ ! -f "$STOCK_BOOT" ]]; then
+            echo "::error::Stock boot image not found: $STOCK_BOOT"
+            exit 1
+          fi
+
+          if grep -q \
+            '^version https://git-lfs.github.com/spec/v1' \
+            "$STOCK_BOOT"; then
+            echo "::error::boot.img is still a Git LFS pointer"
+            exit 1
+          fi
+
+          echo "Stock boot image:"
+          ls -lh "$STOCK_BOOT"
+          sha256sum "$STOCK_BOOT"
+
+      - name: Sync Android GKI source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$SRC_DIR"
+          cd "$SRC_DIR"
+
+          repo init \
+            -u https://android.googlesource.com/kernel/manifest \
+            -b "$MANIFEST_BRANCH"
+
+          repo sync -c -j8 --fail-fast
+
+          git -C common checkout --detach "$KERNEL_TAG"
+
+          git -C common log -1 \
+            --format='%H%n%ci%n%s'
+
+      - name: Extract AVB metadata from stock boot
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$SRC_DIR"
+
+          AVBTOOL="$SRC_DIR/prebuilts/kernel-build-tools/linux-x86/bin/avbtool"
+          STOCK_BOOT="$STOCK_BOOT_DIR/$STOCK_BOOT_PATH"
+
+          mkdir -p "$RELEASE_DIR"
+
+          AVB_INFO="$(
+            "$AVBTOOL" info_image \
+              --image "$STOCK_BOOT"
+          )"
+
+          printf '%s\n' "$AVB_INFO" |
+            tee "$RELEASE_DIR/STOCK-BOOT-AVB-INFO.txt"
+
+          BOOT_PARTITION_SIZE="$(
+            printf '%s\n' "$AVB_INFO" |
+            awk '
+              /^Image size:/ {
+                print $3
+                exit
+              }
+            '
+          )"
+
+          ROLLBACK_INDEX="$(
+            printf '%s\n' "$AVB_INFO" |
+            awk '
+              /^Rollback Index:/ {
+                print $3
+                exit
+              }
+            '
+          )"
+
+          AVB_SALT="$(
+            printf '%s\n' "$AVB_INFO" |
+            awk '
+              /^[[:space:]]*Salt:/ {
+                print $2
+                exit
+              }
+            '
+          )"
+
+          BOOT_OS_VERSION="$(
+            printf '%s\n' "$AVB_INFO" |
+            sed -n \
+              "s/^[[:space:]]*Prop: com.android.build.boot.os_version -> '\(.*\)'$/\1/p" |
+            head -n1
+          )"
+
+          BOOT_FINGERPRINT="$(
+            printf '%s\n' "$AVB_INFO" |
+            sed -n \
+              "s/^[[:space:]]*Prop: com.android.build.boot.fingerprint -> '\(.*\)'$/\1/p" |
+            head -n1
+          )"
+
+          BOOT_SECURITY_PATCH="$(
+            printf '%s\n' "$AVB_INFO" |
+            sed -n \
+              "s/^[[:space:]]*Prop: com.android.build.boot.security_patch -> '\(.*\)'$/\1/p" |
+            head -n1
+          )"
+
+          if [[ ! "$BOOT_PARTITION_SIZE" =~ ^[0-9]+$ ]]; then
+            echo "::error::Invalid boot partition size"
+            exit 1
+          fi
+
+          if [[ ! "$ROLLBACK_INDEX" =~ ^[0-9]+$ ]]; then
+            echo "::error::Invalid or missing rollback index"
+            exit 1
+          fi
+
+          if [[ ! "$AVB_SALT" =~ ^[0-9a-fA-F]{64}$ ]]; then
+            echo "::error::Invalid or missing AVB salt"
+            exit 1
+          fi
+
+          if [[ ! "$BOOT_OS_VERSION" =~ ^[0-9]+$ ]]; then
+            echo "::error::Invalid or missing boot OS version"
+            exit 1
+          fi
+
+          if [[ -z "$BOOT_FINGERPRINT" ]]; then
+            echo "::error::Missing boot fingerprint"
+            exit 1
+          fi
+
+          if [[ ! "$BOOT_SECURITY_PATCH" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            echo "::error::Invalid or missing boot security patch"
+            exit 1
+          fi
+
+          STOCK_BOOT_SHA256="$(
+            sha256sum "$STOCK_BOOT" |
+            awk '{ print $1 }'
+          )"
+
+          {
+            echo "BOOT_PARTITION_SIZE=$BOOT_PARTITION_SIZE"
+            echo "ROLLBACK_INDEX=$ROLLBACK_INDEX"
+            echo "AVB_SALT=$AVB_SALT"
+            echo "BOOT_OS_VERSION=$BOOT_OS_VERSION"
+            echo "BOOT_FINGERPRINT=$BOOT_FINGERPRINT"
+            echo "BOOT_SECURITY_PATCH=$BOOT_SECURITY_PATCH"
+            echo "STOCK_BOOT_SHA256=$STOCK_BOOT_SHA256"
+          } >> "$GITHUB_ENV"
+
+          echo "Extracted stock boot metadata:"
+          echo "BOOT_PARTITION_SIZE=$BOOT_PARTITION_SIZE"
+          echo "ROLLBACK_INDEX=$ROLLBACK_INDEX"
+          echo "AVB_SALT=$AVB_SALT"
+          echo "BOOT_OS_VERSION=$BOOT_OS_VERSION"
+          echo "BOOT_FINGERPRINT=$BOOT_FINGERPRINT"
+          echo "BOOT_SECURITY_PATCH=$BOOT_SECURITY_PATCH"
+          echo "STOCK_BOOT_SHA256=$STOCK_BOOT_SHA256"
+
+      - name: Configure GKI
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$SRC_DIR"
+
+          ./common/scripts/config \
+            --file common/arch/arm64/configs/gki_defconfig \
+            -d MODULE_SIG_PROTECT
+
+          sed -i \
+            '/^# CONFIG_MODULE_SIG_PROTECT is not set$/d' \
+            common/arch/arm64/configs/gki_defconfig
+
+          KERNEL_SHA="$(
+            git -C common rev-parse --short=12 HEAD
+          )"
+
+          SCM_VERSION="-g${KERNEL_SHA}-Jaco-KSU-SUSFS-ab${BUILD_NUMBER}"
+
+          printf '{\n  "SCMVERSION": "%s"\n}\n' \
+            "$SCM_VERSION" \
+            > common/workspace_status.json
+
+          echo "GKI configuration:"
+
+          grep -E \
+            'MODULE_SIG_PROTECT|MODULE_SIG_FORCE|CONFIG_MODVERSIONS' \
+            common/arch/arm64/configs/gki_defconfig || true
+
+          cat common/workspace_status.json
+
+      - name: Install and pin KernelSU
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$SRC_DIR"
+
+          curl \
+            --fail \
+            --location \
+            --silent \
+            --show-error \
+            https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh \
+            -o /tmp/kernelsu-setup.sh
+
+          bash /tmp/kernelsu-setup.sh
+
+          if [[ "$(git -C KernelSU rev-parse --is-shallow-repository)" == "true" ]]; then
+            git -C KernelSU fetch \
+              --unshallow \
+              --tags \
+              origin
+          else
+            git -C KernelSU fetch \
+              --tags \
+              origin
+          fi
+
+          git -C KernelSU checkout \
+            --detach \
+            "${{ inputs.kernelsu_ref }}"
+
+          git -C KernelSU log -1 \
+            --format='%H%n%ci%n%s'
+
+          printf 'KernelSU commit count: '
+          git -C KernelSU rev-list --count HEAD
+
+      - name: Download and pin susfs4ksu
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$SRC_DIR"
+
+          git clone \
+            --branch gki-android15-6.6 \
+            --single-branch \
+            https://gitlab.com/simonpunk/susfs4ksu.git \
+            susfs4ksu
+
+          git -C susfs4ksu checkout \
+            --detach \
+            "${{ inputs.susfs_ref }}"
+
+          git -C susfs4ksu log -1 \
+            --format='%H%n%ci%n%s'
+
+      - name: Apply SUSFS patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$SRC_DIR"
+
+          cp \
+            susfs4ksu/kernel_patches/fs/susfs.c \
+            common/fs/
+
+          cp \
+            susfs4ksu/kernel_patches/include/linux/susfs.h \
+            susfs4ksu/kernel_patches/include/linux/susfs_def.h \
+            common/include/linux/
+
+          git -C KernelSU apply \
+            "$SRC_DIR/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
+
+          git -C common apply \
+            "$SRC_DIR/susfs4ksu/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch"
+
+      - name: Apply Clang 18 compatibility fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$SRC_DIR"
+
+          KSU_FILE=KernelSU/kernel/feature/selinux_hide.c
+
+          sed -i \
+            -e '/^[[:space:]]*if (security_dump_masked_av_fn)[[:space:]]*$/d' \
+            -e '/^[[:space:]]*if (context_struct_compute_av_fn) {[[:space:]]*$/,/^[[:space:]]*}[[:space:]]*$/c\
+              context_struct_compute_av_fn(policydb, scontext, tcontext, tclass, avd, NULL);' \
+            "$KSU_FILE"
+
+          grep -n -B3 -A5 \
+            -E 'security_dump_masked_av_fn|context_struct_compute_av_fn' \
+            "$KSU_FILE"
+
+      - name: Build kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$SRC_DIR"
+
+          mkdir -p "$DIST_DIR"
+
+          tools/bazel run \
+            --config=stamp \
+            --repo_env="BUILD_NUMBER=$BUILD_NUMBER" \
+            --strategy=KernelBuild=local \
+            //common:kernel_aarch64_dist -- \
+            --destdir="$DIST_DIR"
+
+      - name: Verify Image
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$SRC_DIR"
+
+          test -f "$DIST_DIR/Image"
+
+          file "$DIST_DIR/Image"
+
+          KERNEL_VERSION="$(
+            strings "$DIST_DIR/Image" |
+            grep -m1 '^Linux version '
+          )"
+
+          echo "$KERNEL_VERSION"
+
+          printf '%s\n' "$KERNEL_VERSION" |
+            grep -F -- "-Jaco-KSU-SUSFS-ab${BUILD_NUMBER}-4k"
+
+          sha256sum "$DIST_DIR/Image"
+
+      - name: Build boot image
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$SRC_DIR"
+
+          mkdir -p "$RELEASE_DIR"
+
+          python3 tools/mkbootimg/mkbootimg.py \
+            --header_version 4 \
+            --kernel "$DIST_DIR/Image" \
+            --ramdisk /dev/null \
+            --cmdline '' \
+            --output "$RELEASE_DIR/$BOOT_IMAGE"
+
+          prebuilts/kernel-build-tools/linux-x86/bin/avbtool \
+            add_hash_footer \
+            --image "$RELEASE_DIR/$BOOT_IMAGE" \
+            --partition_name boot \
+            --partition_size "$BOOT_PARTITION_SIZE" \
+            --algorithm NONE \
+            --hash_algorithm sha256 \
+            --rollback_index "$ROLLBACK_INDEX" \
+            --prop "com.android.build.boot.os_version:$BOOT_OS_VERSION" \
+            --prop "com.android.build.boot.fingerprint:$BOOT_FINGERPRINT" \
+            --prop "com.android.build.boot.security_patch:$BOOT_SECURITY_PATCH"
+
+          prebuilts/kernel-build-tools/linux-x86/bin/avbtool \
+            info_image \
+            --image "$RELEASE_DIR/$BOOT_IMAGE" |
+            tee "$RELEASE_DIR/GENERATED-BOOT-AVB-INFO.txt"
+
+          test "$(
+            stat -c '%s' "$RELEASE_DIR/$BOOT_IMAGE"
+          )" -eq "$BOOT_PARTITION_SIZE"
+
+          grep -Eq \
+            "^Rollback Index:[[:space:]]+$ROLLBACK_INDEX$" \
+            "$RELEASE_DIR/GENERATED-BOOT-AVB-INFO.txt"
+
+          grep -Eq \
+            "^[[:space:]]*Salt:[[:space:]]+$AVB_SALT$" \
+            "$RELEASE_DIR/GENERATED-BOOT-AVB-INFO.txt"
+
+          grep -F \
+            "com.android.build.boot.os_version -> '$BOOT_OS_VERSION'" \
+            "$RELEASE_DIR/GENERATED-BOOT-AVB-INFO.txt"
+
+          grep -F \
+            "com.android.build.boot.fingerprint -> '$BOOT_FINGERPRINT'" \
+            "$RELEASE_DIR/GENERATED-BOOT-AVB-INFO.txt"
+
+          grep -F \
+            "com.android.build.boot.security_patch -> '$BOOT_SECURITY_PATCH'" \
+            "$RELEASE_DIR/GENERATED-BOOT-AVB-INFO.txt"
+
+      - name: Verify generated boot image
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$SRC_DIR"
+
+          VERIFY_DIR="$SRC_DIR/out/verify-boot"
+
+          mkdir -p "$VERIFY_DIR"
+
+          python3 tools/mkbootimg/unpack_bootimg.py \
+            --boot_img "$RELEASE_DIR/$BOOT_IMAGE" \
+            --out "$VERIFY_DIR" \
+            --format=mkbootimg |
+            tee "$RELEASE_DIR/MKBOOTIMG-ARGS.txt"
+
+          cmp \
+            "$DIST_DIR/Image" \
+            "$VERIFY_DIR/kernel"
+
+          test ! -s "$VERIFY_DIR/ramdisk"
+
+          strings "$VERIFY_DIR/kernel" |
+            grep -m1 '^Linux version '
+
+      - name: Build SUSFS module
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$SRC_DIR/susfs4ksu"
+
+          bash ./build_ksu_module.sh
+
+          test -f ksu_module_susfs.zip
+
+          cp \
+            ksu_module_susfs.zip \
+            "$RELEASE_DIR/"
+
+      - name: Generate build information
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$SRC_DIR"
+
+          cp \
+            "$DIST_DIR/Image" \
+            "$RELEASE_DIR/Image"
+
+          (
+            cd "$RELEASE_DIR"
+
+            sha256sum \
+              ./*.img \
+              ./*.zip \
+              ./Image \
+              > SHA256SUMS.txt
+          )
+
+          {
+            echo "Manifest branch: $MANIFEST_BRANCH"
+            echo "Kernel tag: $KERNEL_TAG"
+            echo "Kernel commit: $(git -C common rev-parse HEAD)"
+            echo "KernelSU commit: $(git -C KernelSU rev-parse HEAD)"
+            echo "SUSFS commit: $(git -C susfs4ksu rev-parse HEAD)"
+            echo "Build number: $BUILD_NUMBER"
+            echo
+            echo "Stock boot repository: $STOCK_BOOT_REPO"
+            echo "Stock boot ref: $STOCK_BOOT_REF"
+            echo "Stock boot path: $STOCK_BOOT_PATH"
+            echo "Stock boot SHA256: $STOCK_BOOT_SHA256"
+            echo
+            echo "Boot partition size: $BOOT_PARTITION_SIZE"
+            echo "AVB salt: $AVB_SALT"
+            echo "Rollback index: $ROLLBACK_INDEX"
+            echo "Boot OS version: $BOOT_OS_VERSION"
+            echo "Boot fingerprint: $BOOT_FINGERPRINT"
+            echo "Boot security patch: $BOOT_SECURITY_PATCH"
+            echo
+
+            strings "$DIST_DIR/Image" |
+              grep -m1 '^Linux version '
+          } > "$RELEASE_DIR/BUILD-INFO.txt"
+
+          ls -lh "$RELEASE_DIR"
+
+          cat "$RELEASE_DIR/SHA256SUMS.txt"
+          cat "$RELEASE_DIR/BUILD-INFO.txt"
+
+      - name: Upload Actions artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bixi-kernel-${{ inputs.release_tag }}
+          path: |
+            kernel-src/out/boot-build/*.img
+            kernel-src/out/boot-build/*.zip
+            kernel-src/out/boot-build/Image
+            kernel-src/out/boot-build/SHA256SUMS.txt
+            kernel-src/out/boot-build/BUILD-INFO.txt
+            kernel-src/out/boot-build/STOCK-BOOT-AVB-INFO.txt
+            kernel-src/out/boot-build/GENERATED-BOOT-AVB-INFO.txt
+            kernel-src/out/boot-build/MKBOOTIMG-ARGS.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Create or update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          RELEASE_FILES=(
+            "$RELEASE_DIR"/*.img
+            "$RELEASE_DIR"/*.zip
+            "$RELEASE_DIR"/Image
+            "$RELEASE_DIR"/SHA256SUMS.txt
+            "$RELEASE_DIR"/BUILD-INFO.txt
+            "$RELEASE_DIR"/STOCK-BOOT-AVB-INFO.txt
+            "$RELEASE_DIR"/GENERATED-BOOT-AVB-INFO.txt
+            "$RELEASE_DIR"/MKBOOTIMG-ARGS.txt
+          )
+
+          if gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+
+            gh release upload "$RELEASE_TAG" \
+              "${RELEASE_FILES[@]}" \
+              --clobber \
+              --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$RELEASE_TAG" \
+              "${RELEASE_FILES[@]}" \
+              --title "$RELEASE_TAG" \
+              --notes-file "$RELEASE_DIR/BUILD-INFO.txt" \
+              --repo "$GITHUB_REPOSITORY"
+          fi
