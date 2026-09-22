@@ -130,6 +130,15 @@ jobs:
 
           git lfs install --skip-repo
 
+      - name: Set current date
+        shell: bash
+        run: |
+          BUILD_DATE="$(TZ=Asia/Shanghai date +'%Y%m%d')"
+          BUILD_DATETIME="$(TZ=Asia/Shanghai date +'%Y%m%d-%H%M')"
+      
+          echo "BUILD_DATE=$BUILD_DATE" >> "$GITHUB_ENV"
+          echo "BUILD_DATETIME=$BUILD_DATETIME" >> "$GITHUB_ENV"
+
       - name: Clone stock boot repository
         shell: bash
         run: |
@@ -322,7 +331,7 @@ jobs:
             git -C common rev-parse --short=12 HEAD
           )"
 
-          SCM_VERSION="-g${KERNEL_SHA}-Jaco-KSU-SUSFS-ab${BUILD_NUMBER}"
+          SCM_VERSION="-Jaco-KSU-SUSFS-${{ env.BUILD_DATE }}"
 
           printf '{\n  "SCMVERSION": "%s"\n}\n' \
             "$SCM_VERSION" \
