@@ -420,6 +420,7 @@ jobs:
             "$SRC_DIR/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
 
           git -C common apply \
+            --3way \
             "$SRC_DIR/susfs4ksu/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch"
 
       - name: Apply Clang 18 compatibility fix
