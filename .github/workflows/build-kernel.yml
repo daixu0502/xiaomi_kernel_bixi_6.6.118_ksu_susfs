@@ -455,25 +455,27 @@ jobs:
             //common:kernel_aarch64_dist -- \
             --destdir="$DIST_DIR"
 
-      - name: Verify Image
+      - name: Verify kernel Image
         shell: bash
         run: |
           set -euo pipefail
+
           cd "$SRC_DIR"
 
           test -f "$DIST_DIR/Image"
-
           file "$DIST_DIR/Image"
 
           KERNEL_VERSION="$(
             strings "$DIST_DIR/Image" |
-            grep -m1 '^Linux version '
+            grep '^Linux version ' |
+            sed -n '1p'
           )"
 
+          test -n "$KERNEL_VERSION"
           echo "$KERNEL_VERSION"
 
           printf '%s\n' "$KERNEL_VERSION" |
-            grep -F -- "-Jaco-KSU-SUSFS-ab${BUILD_NUMBER}-4k"
+            grep -F -- "-Jaco-KSU-SUSFS-${BUILD_DATE}-4k"
 
           sha256sum "$DIST_DIR/Image"
 
